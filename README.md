@@ -15,6 +15,7 @@ everything, with safe, backed-up deletion.
 
 ```
 oc-sessions                      interactive: list all, pick numbers to delete (space-separated)
+                                 or type 'vacuum' to reclaim space after deletions
 oc-sessions list                 list all sessions (all projects, incl. sub-sessions)
 oc-sessions list <keyword>       filter by keyword (matches title / project path / id)
 oc-sessions delete <id> [<id>...] delete one or more sessions, each incl. all its sub-sessions

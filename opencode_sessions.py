@@ -356,9 +356,16 @@ def cmd_interactive(con, db_path, data_dir, backup_dir):
     show_list(rows)
     print()
     try:
-        raw = input("enter numbers to delete, space-separated (enter to cancel): ")
+        raw = input("enter numbers to delete, space-separated, or 'vacuum' to reclaim space (enter to cancel): ")
     except EOFError:
         print("cancelled")
+        return
+    if raw.strip().lower() == "vacuum":
+        try:
+            con.execute("ROLLBACK")
+        except sqlite3.OperationalError:
+            pass
+        cmd_vacuum(con, db_path)
         return
     tokens = raw.split()
     if not tokens:
