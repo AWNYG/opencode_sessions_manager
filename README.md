@@ -52,20 +52,23 @@ Batch deletion notes:
 
 ## Output
 
-Each session is one line; the id is shown in full, right-aligned at the end of the line
-(capped at 100 columns). If the id leaves too little room, the project / title part is
-truncated with `...` (Chinese/wide characters count as 2 columns):
+Three columns fill the terminal width: a fixed-width `title`, a fixed-width project area
+rendered as an inline tree (common prefix + `├─` / `└─` branches), and the full `id`
+right-aligned at the end. Long titles are truncated with `...`; long project paths are
+truncated from the left with `...` keeping the tree tail (Chinese/wide characters count
+as 2 columns):
 
 ```
 total: 29 sessions
 
-  #  updated          type     project / title                                                    id
-  1. 2026-08-27 01:01 build    / | Some session title                     ses_1a2b3c4d5e6f7890abcdef
+  #  title                          project                                                                           id
+  1. 生成周报                       ...s/you/Documents/OpenCode/└─ 电力交易市场数据 ses_1a2b3c4d5e6f7890abcdef1234567890
+  2. |_ 计算指标                    C:/Users/you/Documents/Python/└─ pythontest     ses_00000000000000000000000000000000
 ```
 
-- `type`: `build` / `plan` = main session, `sub` = sub-agent session (deleted automatically
-  together with its parent)
-- `project`: `/` = global project (not inside a git repo), otherwise the project path
+- `title`: sub-agent sessions are marked with a leading `|_`
+- `project`: each session's actual directory, drawn as a tree of paths (sessions sorted
+  by project path so branches group together)
 
 ## Safety
 

@@ -90,16 +90,11 @@ def open_writable(db_path):
     return con
 
 
-def fmt_time(ms):
-    if not ms:
-        return "-"
-    return datetime.datetime.fromtimestamp(ms / 1000).strftime("%Y-%m-%d %H:%M")
-
-
 def list_sessions(con, keyword=None):
     rows = con.execute(
         """
-        SELECT s.id, s.title, s.parent_id, s.agent, s.time_updated, p.worktree AS proj_dir
+        SELECT s.id, s.title, s.parent_id, s.agent, s.time_updated,
+               COALESCE(NULLIF(s.directory, ''), p.worktree) AS proj_dir
         FROM session s LEFT JOIN project p ON p.id = s.project_id
         ORDER BY s.time_updated DESC
         """
@@ -135,26 +130,96 @@ def clip_to(s, w):
     return "".join(out) + "..."
 
 
+def left_clip(s, w):
+    if disp_width(s) <= w:
+        return s
+    used = 0
+    tail = []
+    for c in reversed(s):
+        cw = 2 if unicodedata.east_asian_width(c) in ("W", "F") else 1
+        if used + cw > w - 3:
+            break
+        tail.append(c)
+        used += cw
+    return "..." + "".join(reversed(tail))
+
+
+def path_components(p):
+    return [c for c in p.replace("\\", "/").split("/") if c]
+
+
+def lcp_components(paths):
+    """Longest common prefix (by path components) across all paths."""
+    if not paths:
+        return []
+    first = paths[0]
+    n = 0
+    for i in range(len(first)):
+        if all(len(p) > i and p[i] == first[i] for p in paths):
+            n = i + 1
+        else:
+            break
+    return first[:n]
+
+
+def tree_cell(path, all_paths):
+    """Render one path as an inline tree line: common prefix + ├─/└─ branches."""
+    comps = path_components(path)
+    if not comps:
+        return "global"
+    paths = sorted({tuple(path_components(p)) for p in all_paths})
+    if len(paths) <= 1:
+        return "/".join(comps)
+    lcp = lcp_components(paths)
+    root = {}
+    for p in paths:
+        node = root
+        for c in p:
+            node = node.setdefault(c, {})
+    node = root
+    parts = []
+    if lcp:
+        parts.append("/".join(lcp) + "/")
+        for c in lcp:
+            node = node[c]
+    rest = comps[len(lcp):]
+    for i, c in enumerate(rest):
+        keys = list(node.keys())
+        is_last = keys[-1] == c
+        is_leaf = i == len(rest) - 1
+        child = node[c]
+        if is_leaf:
+            parts.append(("└─ " if is_last else "├─ ") + c)
+        elif len(child) == 1:
+            parts.append(c + "/")
+        else:
+            parts.append(("└─ " if is_last else "├─ ") + c + "/")
+        node = child
+    return "".join(parts)
+
+
 def show_list(rows):
     if not rows:
         print("(no sessions match)")
         return
-    term_w = min(shutil.get_terminal_size((100, 24)).columns, 100)
+    rows = sorted(rows, key=lambda r: ((r["proj_dir"] or "").lower(), -(r["time_updated"] or 0)))
+    term_w = shutil.get_terminal_size((120, 24)).columns
+    id_w = max(len(r["id"]) for r in rows)
+    avail = max(10, term_w - id_w - 7)
+    title_w = min(50, max(16, int(avail * 0.4)))
+    proj_w = avail - title_w
+    if proj_w < 16:
+        proj_w = 16
+        title_w = max(16, avail - proj_w)
+    paths = [r["proj_dir"] for r in rows if r["proj_dir"]]
     print(f"total: {len(rows)} sessions\n")
-    head_left = pad_to("project / title", max(15, term_w - 34))
-    print(f"{'#':>3}  {'updated':<16} {'type':<8} {head_left} id")
+    print(f"{'#':>3}  {pad_to('title', title_w)} {pad_to('project', proj_w)} {'id':>{id_w}}")
     print("-" * term_w)
     for i, r in enumerate(rows, 1):
-        kind = "sub" if r["parent_id"] else (r["agent"] or "main")
-        title = (r["title"] or "").replace("\n", " ")
-        proj = r["proj_dir"] or "global"
-        mark = "  |_" if r["parent_id"] else ""
-        left = f"{mark}{proj} | {title}"
-        sid = r["id"]
-        avail = max(15, term_w - 31 - 1 - disp_width(sid))
-        if disp_width(left) > avail:
-            left = clip_to(left, avail)
-        print(f"{i:>3}. {fmt_time(r['time_updated']):<16} {kind:<8} {pad_to(left, avail)} {sid}")
+        mark = "|_ " if r["parent_id"] else ""
+        title = clip_to(mark + (r["title"] or "").replace("\n", " "), title_w)
+        cell = left_clip(tree_cell(r["proj_dir"] or "", paths), proj_w)
+        print(f"{i:>3}. {pad_to(title, title_w)} {pad_to(cell, proj_w)} {r['id']:>{id_w}}")
 
 
 def find_session(con, session_id):
@@ -458,6 +523,7 @@ def pause_exit():
         return
     if not sys.stdin.isatty():
         return
+    sys.stdout.flush()
     try:
         if sys.platform.startswith("win"):
             os.system("pause")
