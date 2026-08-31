@@ -52,12 +52,15 @@ Batch deletion notes:
 
 ## Output
 
+Each session is one line; the id is shown in full, right-aligned at the end of the line
+(capped at 100 columns). If the id leaves too little room, the project / title part is
+truncated with `...` (Chinese/wide characters count as 2 columns):
+
 ```
 total: 29 sessions
 
-  #  updated          type     project / title
-  1. 2026-08-27 01:01 build    / | Some session title
-      id: ses_fc1694...
+  #  updated          type     project / title                                                    id
+  1. 2026-08-27 01:01 build    / | Some session title                     ses_1a2b3c4d5e6f7890abcdef
 ```
 
 - `type`: `build` / `plan` = main session, `sub` = sub-agent session (deleted automatically
@@ -119,4 +122,7 @@ target machine.
 - Backups accumulate over time; clean the backup folder periodically.
 - The database uses WAL mode; do not manually delete `opencode.db-wal` / `opencode.db-shm`
   during normal use (only when restoring a backup as shown above).
+- When run from a console (e.g. the double-clicked EXE), the window stays open with a
+  "press any key" prompt after finishing; set `OC_SESSIONS_NO_PAUSE=1` to disable it.
+  When output is piped, the pause is skipped automatically.
 - For testing only: `OC_SESSIONS_SKIP_RUN_CHECK=1` disables the running-process check.

@@ -12,6 +12,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import unicodedata
 from collections import deque
 
 APP_NAME = "oc-sessions"
@@ -112,20 +113,48 @@ def list_sessions(con, keyword=None):
     return rows
 
 
+def disp_width(s):
+    return sum(2 if unicodedata.east_asian_width(c) in ("W", "F") else 1 for c in s)
+
+
+def pad_to(s, w):
+    return s + " " * max(0, w - disp_width(s))
+
+
+def clip_to(s, w):
+    if disp_width(s) <= w:
+        return s
+    used = 0
+    out = []
+    for c in s:
+        cw = 2 if unicodedata.east_asian_width(c) in ("W", "F") else 1
+        if used + cw > w - 3:
+            break
+        out.append(c)
+        used += cw
+    return "".join(out) + "..."
+
+
 def show_list(rows):
     if not rows:
         print("(no sessions match)")
         return
+    term_w = min(shutil.get_terminal_size((100, 24)).columns, 100)
     print(f"total: {len(rows)} sessions\n")
-    print(f"{'#':>3}  {'updated':<16} {'type':<8} project / title")
-    print("-" * 100)
+    head_left = pad_to("project / title", max(15, term_w - 34))
+    print(f"{'#':>3}  {'updated':<16} {'type':<8} {head_left} id")
+    print("-" * term_w)
     for i, r in enumerate(rows, 1):
         kind = "sub" if r["parent_id"] else (r["agent"] or "main")
-        title = (r["title"] or "").replace("\n", " ")[:45]
+        title = (r["title"] or "").replace("\n", " ")
         proj = r["proj_dir"] or "global"
         mark = "  |_" if r["parent_id"] else ""
-        print(f"{i:>3}. {fmt_time(r['time_updated']):<16} {kind:<8} {mark}{proj} | {title}")
-        print(f"      id: {r['id']}")
+        left = f"{mark}{proj} | {title}"
+        sid = r["id"]
+        avail = max(15, term_w - 31 - 1 - disp_width(sid))
+        if disp_width(left) > avail:
+            left = clip_to(left, avail)
+        print(f"{i:>3}. {fmt_time(r['time_updated']):<16} {kind:<8} {pad_to(left, avail)} {sid}")
 
 
 def find_session(con, session_id):
@@ -423,40 +452,58 @@ def build_parser():
     return parser
 
 
+def pause_exit():
+    """Keep the console window open when run interactively (e.g. double-clicked exe)."""
+    if os.environ.get("OC_SESSIONS_NO_PAUSE"):
+        return
+    if not sys.stdin.isatty():
+        return
+    try:
+        if sys.platform.startswith("win"):
+            os.system("pause")
+        else:
+            input("press Enter to exit...")
+    except (EOFError, KeyboardInterrupt):
+        pass
+
+
 def main(argv=None):
-    args = build_parser().parse_args(argv)
+    try:
+        args = build_parser().parse_args(argv)
 
-    data_dir = detect_data_dir(args.data_dir)
-    if args.data_dir and not os.path.isdir(args.data_dir):
-        print(f"[!] data dir not found: {args.data_dir}")
-        sys.exit(1)
-    db_path = os.path.join(data_dir, DB_NAME)
-    if not os.path.exists(db_path):
-        print(f"[!] database not found: {db_path}")
-        print("    pass --data-dir <path> if your opencode data lives elsewhere")
-        sys.exit(1)
+        data_dir = detect_data_dir(args.data_dir)
+        if args.data_dir and not os.path.isdir(args.data_dir):
+            print(f"[!] data dir not found: {args.data_dir}")
+            sys.exit(1)
+        db_path = os.path.join(data_dir, DB_NAME)
+        if not os.path.exists(db_path):
+            print(f"[!] database not found: {db_path}")
+            print("    pass --data-dir <path> if your opencode data lives elsewhere")
+            sys.exit(1)
 
-    if args.cmd in ("delete", "delete-project") or args.cmd is None:
-        con = open_writable(db_path)
-    elif args.cmd == "vacuum":
-        check_not_running()
-        con = connect(db_path, read_only=False)
-    else:
-        con = connect(db_path, read_only=True)
+        if args.cmd in ("delete", "delete-project") or args.cmd is None:
+            con = open_writable(db_path)
+        elif args.cmd == "vacuum":
+            check_not_running()
+            con = connect(db_path, read_only=False)
+        else:
+            con = connect(db_path, read_only=True)
 
-    backup_dir = args.backup_dir or os.path.join(os.path.dirname(os.path.abspath(data_dir)), "oc-sessions-backups")
+        backup_dir = args.backup_dir or os.path.join(os.path.dirname(os.path.abspath(data_dir)), "oc-sessions-backups")
 
-    if args.cmd == "list":
-        cmd_list(con, args)
-    elif args.cmd == "delete":
-        cmd_delete(con, db_path, data_dir, backup_dir, args)
-    elif args.cmd == "delete-project":
-        cmd_delete_project(con, db_path, data_dir, backup_dir, args)
-    elif args.cmd == "vacuum":
-        cmd_vacuum(con, db_path)
-    else:
-        cmd_interactive(con, db_path, data_dir, backup_dir)
-    con.close()
+        if args.cmd == "list":
+            cmd_list(con, args)
+        elif args.cmd == "delete":
+            cmd_delete(con, db_path, data_dir, backup_dir, args)
+        elif args.cmd == "delete-project":
+            cmd_delete_project(con, db_path, data_dir, backup_dir, args)
+        elif args.cmd == "vacuum":
+            cmd_vacuum(con, db_path)
+        else:
+            cmd_interactive(con, db_path, data_dir, backup_dir)
+        con.close()
+    finally:
+        pause_exit()
 
 
 if __name__ == "__main__":
