@@ -14,12 +14,13 @@ everything, with safe, backed-up deletion.
 ## Usage
 
 ```
-oc-sessions                      interactive: list all sessions, pick a number to delete
+oc-sessions                      interactive: list all, pick numbers to delete (space-separated)
 oc-sessions list                 list all sessions (all projects, incl. sub-sessions)
 oc-sessions list <keyword>       filter by keyword (matches title / project path / id)
-oc-sessions delete <id>          delete one session incl. all its sub-sessions
+oc-sessions delete <id> [<id>...] delete one or more sessions, each incl. all its sub-sessions
 oc-sessions delete <id> --yes    same, skip confirmation
 oc-sessions delete-project <dir> delete all sessions of a matching project
+oc-sessions vacuum               reclaim free space after deletions
 ```
 
 ### Options
@@ -35,9 +36,18 @@ oc-sessions delete-project <dir> delete all sessions of a matching project
 oc-sessions list
 oc-sessions list stock
 oc-sessions delete ses_xxxxxxxx
+oc-sessions delete ses_aaaa ses_bbbb --yes
 oc-sessions delete-project market
+oc-sessions vacuum
 oc-sessions --data-dir C:\opencode-data list
 ```
+
+Batch deletion notes:
+
+- Multiple session ids are validated up-front; if any id is missing, **nothing** is deleted.
+- Sub-sessions of a selected session are deleted automatically, so selecting a parent and
+  its child together deletes the child only once.
+- One confirmation, one backup and one commit cover the whole batch.
 
 ## Output
 
@@ -67,6 +77,20 @@ Deletion is safe by design:
 4. **Sub-sessions** - deleting a parent session recursively deletes its sub-sessions.
 5. **Snapshot cleanup** - when a project's last session is deleted, its `snapshot/` folder is
    removed (failure is only a warning; it never blocks the database deletion).
+
+## Vacuum
+
+SQLite `DELETE` frees rows but never shrinks the database file - deleted pages stay in the
+file as free space, so the `.db` size keeps its high-water mark. After deleting many
+sessions, run:
+
+```
+oc-sessions vacuum
+```
+
+This runs SQLite `VACUUM` to rebuild the file and reclaim all free pages (e.g. 152 MB
+with 99% free pages shrinks to a few MB). Exit opencode first; no backup is created by
+vacuum itself since it only reclaims already-deleted data.
 
 ## Restore from backup
 

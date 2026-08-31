@@ -7,6 +7,7 @@ Standalone tool, standard library only. Safe for PyInstaller packaging.
 import argparse
 import datetime
 import os
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -70,15 +71,16 @@ def check_not_running():
         if running:
             print("[!] opencode is running - please exit opencode first and retry")
             sys.exit(1)
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[!] could not verify opencode process state ({e}); continuing anyway")
 
 
 def open_writable(db_path):
     """Open a locked writable connection for deletion (with running-process check)."""
     check_not_running()
     con = connect(db_path, read_only=False)
-    con.execute("PRAGMA busy_timeout=500")
+    con.execute("PRAGMA foreign_keys=ON")
+    con.execute("PRAGMA busy_timeout=5000")
     try:
         con.execute("BEGIN IMMEDIATE")
     except sqlite3.OperationalError:
@@ -135,6 +137,9 @@ def discover_child_tables(con):
     cols = {t: "session_id" for t in CHILD_TABLES}
     for row in con.execute("SELECT name FROM sqlite_master WHERE type='table'"):
         name = row["name"]
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
+            print(f"[!] skipping table with suspicious name: {name!r}")
+            continue
         try:
             fks = con.execute(f'PRAGMA foreign_key_list("{name}")').fetchall()
         except sqlite3.Error:
@@ -144,7 +149,7 @@ def discover_child_tables(con):
                 cols.setdefault(name, fk["from"])
     for row in con.execute("SELECT name FROM sqlite_master WHERE type='table'"):
         name = row["name"]
-        if name in cols:
+        if name in cols or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
             continue
         try:
             cols_i = con.execute(f'PRAGMA table_info("{name}")').fetchall()
@@ -152,6 +157,7 @@ def discover_child_tables(con):
             continue
         if any(c["name"] == "session_id" for c in cols_i):
             cols[name] = "session_id"
+            print(f"[!] heuristic: '{name}' has a session_id column but no FK to session; will delete by it")
     return cols
 
 
@@ -168,7 +174,6 @@ def collect_descendants(con, session_id):
 
 def delete_session_rows(con, session_id):
     ids = collect_descendants(con, session_id)
-    con.execute("PRAGMA foreign_keys=ON")
     tables = discover_child_tables(con)
     for sid in reversed(ids):
         con.execute("DELETE FROM event WHERE aggregate_id=?", (sid,))
@@ -194,7 +199,7 @@ def backup_db(db_path, backup_dir):
         dst.close()
         src.close()
         try:
-            os.remove(target)
+            shutil.rmtree(dest)
         except OSError:
             pass
         raise
@@ -202,6 +207,23 @@ def backup_db(db_path, backup_dir):
     src.close()
     print(f"[i] backup saved to: {dest}")
     return dest
+
+
+def cmd_vacuum(con, db_path):
+    before = os.path.getsize(db_path)
+    print(f"[i] db size before: {before / 1024 / 1024:.2f} MB")
+    try:
+        con.execute("VACUUM")
+        con.commit()
+        con.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        con.commit()
+    except sqlite3.Error as e:
+        print(f"[!] vacuum failed: {e}")
+        print("    database left unchanged")
+        sys.exit(1)
+    after = os.path.getsize(db_path)
+    freed = (before - after) / 1024 / 1024
+    print(f"[OK] vacuum done: {after / 1024 / 1024:.2f} MB (freed {freed:.2f} MB)")
 
 
 def cleanup_snapshots(con, data_dir, project_id):
@@ -214,7 +236,7 @@ def cleanup_snapshots(con, data_dir, project_id):
     if os.path.isdir(snap):
         try:
             shutil.rmtree(snap)
-            print(f"[i] removed snapshot dir: snapshot\\{project_id[:12]}...")
+            print(f"[i] removed snapshot dir: {SNAPSHOT_DIR}{os.sep}{project_id[:12]}...")
         except OSError as e:
             print(f"[!] failed to remove snapshot dir (db deletion already done): {snap}")
             print(f"    reason: {e}")
@@ -224,26 +246,69 @@ def cmd_list(con, args):
     show_list(list_sessions(con, args.keyword))
 
 
-def cmd_delete(con, db_path, data_dir, backup_dir, args):
-    s = find_session(con, args.session)
-    if not s:
-        print(f"[!] session not found: {args.session}")
+def expand_delete_set(con, session_ids):
+    """Validate all ids, then expand to descendant sets with sub-session dedupe."""
+    missing = []
+    rows = {}
+    for sid in session_ids:
+        r = find_session(con, sid)
+        if not r:
+            missing.append(sid)
+        else:
+            rows[sid] = r
+    if missing:
+        print("[!] sessions not found:")
+        for sid in missing:
+            print(f"    - {sid}")
+        print("    nothing was deleted")
         sys.exit(1)
-    ids = collect_descendants(con, args.session)
-    label = "sub-session" if s["parent_id"] else "main session"
-    extra = f" + {len(ids) - 1} sub-session(s)" if len(ids) > 1 else ""
-    print(f"[i] will delete 1 {label}{extra}:")
-    for sid in ids:
-        info = find_session(con, sid)
-        print(f"    - {sid}  {(info['title'] or '')[:50]}")
+    seen = set()
+    targets = []
+    for sid in session_ids:
+        if sid in seen:
+            continue
+        ids = collect_descendants(con, sid)
+        fresh = [i for i in ids if i not in seen]
+        seen.update(ids)
+        is_sub = bool(rows[sid]["parent_id"])
+        targets.append((sid, is_sub, fresh[1:]))
+    return targets
+
+
+def cmd_delete(con, db_path, data_dir, backup_dir, args):
+    targets = expand_delete_set(con, args.sessions)
+    total = sum(1 + len(subs) for _, _, subs in targets)
+    tag = "[dry-run] " if args.dry_run else ""
+    print(f"{tag}[i] will delete {total} session(s) from {len(targets)} selection(s):")
+    for root, is_sub, subs in targets:
+        info = find_session(con, root)
+        mark = "[sub]" if is_sub else "[sel]"
+        print(f"    {mark} {root}  {(info['title'] or '')[:50]}")
+        for sid in subs:
+            info2 = find_session(con, sid)
+            print(f"          |_ {sid}  {(info2['title'] or '')[:50]}")
+    if args.dry_run:
+        print("[dry-run] nothing was deleted")
+        return
     if not args.yes and input("confirm delete? [y/N] ").lower() != "y":
         print("cancelled")
         return
     backup_db(db_path, backup_dir)
-    deleted = delete_session_rows(con, args.session)
+    projects = set()
+    try:
+        for root, _, _ in targets:
+            info = find_session(con, root)
+            projects.add(info["project_id"])
+            delete_session_rows(con, root)
+    except sqlite3.Error as e:
+        con.rollback()
+        print(f"[!] delete failed: {e}")
+        print("    transaction rolled back - nothing was committed")
+        sys.exit(1)
     con.commit()
-    print(f"[OK] deleted {len(deleted)} session(s)")
-    cleanup_snapshots(con, data_dir, s["project_id"])
+    print(f"[OK] deleted {total} session(s)")
+    for pid in projects:
+        cleanup_snapshots(con, data_dir, pid)
 
 
 def cmd_delete_project(con, db_path, data_dir, backup_dir, args):
@@ -263,14 +328,23 @@ def cmd_delete_project(con, db_path, data_dir, backup_dir, args):
         targets.append((p, sess))
     for p, sess in targets:
         print(f"[i] project: {p['worktree']} ({p['id'][:12]}...)  -> {len(sess)} session(s)")
+    if args.dry_run:
+        print("[dry-run] nothing was deleted")
+        return
     if not args.yes and input("confirm delete all above? [y/N] ").lower() != "y":
         print("cancelled")
         return
     backup_db(db_path, backup_dir)
     deleted_all = []
-    for p, sess in targets:
-        for row in sess:
-            deleted_all.extend(delete_session_rows(con, row["id"]))
+    try:
+        for p, sess in targets:
+            for row in sess:
+                deleted_all.extend(delete_session_rows(con, row["id"]))
+    except sqlite3.Error as e:
+        con.rollback()
+        print(f"[!] delete failed: {e}")
+        print("    transaction rolled back - nothing was committed")
+        sys.exit(1)
     con.commit()
     print(f"[OK] deleted {len(set(deleted_all))} session(s)")
     for p, sess in targets:
@@ -282,19 +356,30 @@ def cmd_interactive(con, db_path, data_dir, backup_dir):
     show_list(rows)
     print()
     try:
-        n = int(input("enter number to delete (enter to cancel): "))
-    except (ValueError, EOFError):
+        raw = input("enter numbers to delete, space-separated (enter to cancel): ")
+    except EOFError:
         print("cancelled")
         return
-    if not 1 <= n <= len(rows):
-        print("invalid number")
+    tokens = raw.split()
+    if not tokens:
+        print("cancelled")
         return
+    nums = []
+    for t in tokens:
+        try:
+            n = int(t)
+        except ValueError:
+            print(f"[!] invalid number: {t}")
+            print("    nothing was deleted")
+            return
+        if not 1 <= n <= len(rows):
+            print(f"[!] number out of range: {n}")
+            print("    nothing was deleted")
+            return
+        nums.append(n)
+    ids = [rows[n - 1]["id"] for n in dict.fromkeys(nums)]
     print()
-    con = open_writable(db_path)
-    try:
-        cmd_delete(con, db_path, data_dir, backup_dir, argparse.Namespace(session=rows[n - 1]["id"], yes=False))
-    finally:
-        con.close()
+    cmd_delete(con, db_path, data_dir, backup_dir, argparse.Namespace(sessions=ids, yes=False, dry_run=False))
 
 
 def build_parser():
@@ -304,12 +389,14 @@ def build_parser():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "examples:\n"
-            "  oc-sessions                      interactive: list all, pick a number to delete\n"
+            "  oc-sessions                      interactive: list all, pick numbers to delete\n"
             "  oc-sessions list                 list all sessions (all projects)\n"
             "  oc-sessions list <keyword>       filter by keyword (title / project / id)\n"
-            "  oc-sessions delete <id>          delete a session incl. its sub-sessions\n"
+            "  oc-sessions delete <id> [<id>...] delete one or more sessions (each incl. its sub-sessions)\n"
+            "  oc-sessions delete <id> --dry-run  preview deletion without changing anything\n"
             "  oc-sessions delete <id> --yes    skip confirmation\n"
             "  oc-sessions delete-project <dir> delete all sessions of matching project\n"
+            "  oc-sessions vacuum             reclaim free space after deletions\n"
         ),
     )
     parser.add_argument("--data-dir", metavar="PATH", help="opencode data dir (auto-detected by default)")
@@ -317,12 +404,15 @@ def build_parser():
     sub = parser.add_subparsers(dest="cmd")
     p_list = sub.add_parser("list", help="list all sessions (optional keyword filter)")
     p_list.add_argument("keyword", nargs="?", default=None)
-    p_del = sub.add_parser("delete", help="delete a session including its sub-sessions")
-    p_del.add_argument("session")
+    p_del = sub.add_parser("delete", help="delete one or more sessions including their sub-sessions")
+    p_del.add_argument("sessions", nargs="+", metavar="id")
     p_del.add_argument("--yes", action="store_true")
+    p_del.add_argument("--dry-run", action="store_true", help="show what would be deleted without deleting")
     p_dp = sub.add_parser("delete-project", help="delete all sessions of a matching project")
     p_dp.add_argument("dir")
     p_dp.add_argument("--yes", action="store_true")
+    p_dp.add_argument("--dry-run", action="store_true", help="show what would be deleted without deleting")
+    sub.add_parser("vacuum", help="reclaim free space: DELETE frees pages but never shrinks the file")
     return parser
 
 
@@ -330,14 +420,20 @@ def main(argv=None):
     args = build_parser().parse_args(argv)
 
     data_dir = detect_data_dir(args.data_dir)
+    if args.data_dir and not os.path.isdir(args.data_dir):
+        print(f"[!] data dir not found: {args.data_dir}")
+        sys.exit(1)
     db_path = os.path.join(data_dir, DB_NAME)
     if not os.path.exists(db_path):
         print(f"[!] database not found: {db_path}")
         print("    pass --data-dir <path> if your opencode data lives elsewhere")
         sys.exit(1)
 
-    if args.cmd in ("delete", "delete-project"):
+    if args.cmd in ("delete", "delete-project") or args.cmd is None:
         con = open_writable(db_path)
+    elif args.cmd == "vacuum":
+        check_not_running()
+        con = connect(db_path, read_only=False)
     else:
         con = connect(db_path, read_only=True)
 
@@ -349,6 +445,8 @@ def main(argv=None):
         cmd_delete(con, db_path, data_dir, backup_dir, args)
     elif args.cmd == "delete-project":
         cmd_delete_project(con, db_path, data_dir, backup_dir, args)
+    elif args.cmd == "vacuum":
+        cmd_vacuum(con, db_path)
     else:
         cmd_interactive(con, db_path, data_dir, backup_dir)
     con.close()
